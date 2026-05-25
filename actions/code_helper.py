@@ -549,30 +549,44 @@ def code_helper(
         action = _detect_intent(description, file_path, code)
         print(f"[Code] 🤖 Auto-detected: {action}")
 
-    if action == "write":
-        return _write_action(description, language, output_path, player)
+    task_id = f"single_task_{action}_{int(time.time())}"
+    if player and hasattr(player, "show_project_monitor"):
+        player.show_project_monitor()
+        player.log_project_terminal(f"\n=== NEW CODE TASK: {action.upper()} ===")
+        player.add_project_task(task_id, f"{action.capitalize()}: {Path(file_path).name if file_path else (Path(output_path).name if output_path else 'code snippet')}")
+        player.update_project_task(task_id, "in_progress")
+        if description:
+            player.log_project_terminal(f"> {description}")
 
-    elif action == "edit":
-        return _edit_action(
-            file_path,
-            description or p.get("instruction", ""),
-            player
-        )
-
-    elif action == "explain":
-        return _explain_action(file_path, code, player)
-
-    elif action == "run":
-        return _run_action(file_path, args, timeout, player)
-
-    elif action == "build":
-        return _build(description, language, output_path, args, timeout, speak, player)
-
-    elif action == "optimize":
-        return _optimize_action(file_path, code, language, output_path, player)
-
-    elif action == "screen_debug":
-        return _screen_debug_action(description, file_path, player, speak)
-
-    else:
-        return f"Unknown action: '{action}'. Use write, edit, explain, run, build, optimize, or screen_debug."
+    try:
+        if action == "write":
+            res = _write_action(description, language, output_path, player)
+        elif action == "edit":
+            res = _edit_action(
+                file_path,
+                description or p.get("instruction", ""),
+                player
+            )
+        elif action == "explain":
+            res = _explain_action(file_path, code, player)
+        elif action == "run":
+            res = _run_action(file_path, args, timeout, player)
+        elif action == "build":
+            res = _build(description, language, output_path, args, timeout, speak, player)
+        elif action == "optimize":
+            res = _optimize_action(file_path, code, language, output_path, player)
+        elif action == "screen_debug":
+            res = _screen_debug_action(description, file_path, player, speak)
+        else:
+            res = f"Unknown action: '{action}'. Use write, edit, explain, run, build, optimize, or screen_debug."
+            
+        if player and hasattr(player, "log_project_terminal"):
+            player.log_project_terminal(f"\nResult:\n{res}")
+            player.update_project_task(task_id, "completed")
+            
+        return res
+    except Exception as e:
+        if player and hasattr(player, "log_project_terminal"):
+            player.log_project_terminal(f"\nError:\n{e}")
+            player.update_project_task(task_id, "failed")
+        raise

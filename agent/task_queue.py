@@ -31,11 +31,12 @@ class Task:
     error:       str        = field(compare=False, default="")
     speak:       Any        = field(compare=False, default=None)   
     on_complete: Any        = field(compare=False, default=None)  
+    player:      Any        = field(compare=False, default=None)
     cancel_flag: threading.Event = field(compare=False, default_factory=threading.Event)
 
 
 class TaskQueue:
-    def __init__(self, max_concurrent: int = 1):
+    def __init__(self, max_concurrent: int = 5):
         self._queue:        list[Task]       = []
         self._lock:         threading.Lock   = threading.Lock()
         self._condition:    threading.Condition = threading.Condition(self._lock)
@@ -76,6 +77,7 @@ class TaskQueue:
         priority:    TaskPriority = TaskPriority.NORMAL,
         speak:       Callable | None = None,
         on_complete: Callable | None = None,
+        player:      Any = None,
     ) -> str:
 
         task_id = str(uuid.uuid4())[:8]
@@ -86,6 +88,7 @@ class TaskQueue:
             goal        = goal,
             speak       = speak,
             on_complete = on_complete,
+            player      = player,
         )
 
         with self._condition:
@@ -93,6 +96,12 @@ class TaskQueue:
             self._queue.sort(key=lambda t: (t.priority, t.created_at))
             self._tasks[task_id] = task
             self._condition.notify()
+
+        if player and hasattr(player, "show_project_monitor"):
+            player.show_project_monitor()
+            player.add_project_task(task_id, f"Agent Task: {goal[:50]}...")
+            player.log_project_terminal(f"=== QUEUED TASK [{task_id}] ===")
+            player.log_project_terminal(f"> {goal}")
 
         print(f"[TaskQueue] 📥 Task queued: [{task_id}] {goal[:60]}")
         return task_id
@@ -173,6 +182,10 @@ class TaskQueue:
 
     def _run_task(self, task: Task) -> None:
         print(f"[TaskQueue] ▶️ Running: [{task.task_id}] {task.goal[:60]}")
+        if task.player and hasattr(task.player, "update_project_task"):
+            task.player.update_project_task(task.task_id, "in_progress")
+            task.player.log_project_terminal(f"\n--- Running Task [{task.task_id}] ---")
+            
         try:
             executor = self._get_executor()
             result   = executor.execute(
@@ -184,9 +197,14 @@ class TaskQueue:
             with self._lock:
                 if task.cancel_flag.is_set():
                     task.status = TaskStatus.CANCELLED
+                    if task.player and hasattr(task.player, "log_project_terminal"):
+                        task.player.log_project_terminal(f"Task {task.task_id} CANCELLED.")
                 else:
                     task.status = TaskStatus.COMPLETED
                     task.result = result
+                    if task.player and hasattr(task.player, "update_project_task"):
+                        task.player.update_project_task(task.task_id, "completed")
+                        task.player.log_project_terminal(f"Result for {task.task_id}:\n{result}")
                 self._active_count -= 1
 
             if task.on_complete and not task.cancel_flag.is_set():
@@ -201,6 +219,9 @@ class TaskQueue:
             with self._lock:
                 task.status = TaskStatus.FAILED
                 task.error  = str(e)
+                if task.player and hasattr(task.player, "update_project_task"):
+                    task.player.update_project_task(task.task_id, "failed")
+                    task.player.log_project_terminal(f"Error in {task.task_id}:\n{e}")
                 self._active_count -= 1
             print(f"[TaskQueue] ❌ Failed: [{task.task_id}] {e}")
 

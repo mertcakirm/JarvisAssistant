@@ -466,6 +466,12 @@ def _build_project(
     run_command  = plan.get("run_command", f"python {entry_point}")
     dependencies = plan.get("dependencies", [])
 
+    if player and hasattr(player, "show_project_monitor"):
+        player.show_project_monitor()
+        player.log_project_terminal("=== STARTING PROJECT BUILD ===")
+        player.log_project_terminal(f"Project Name: {proj_name}")
+        player.log_project_terminal(f"Language: {language}")
+
     log(f"Project: {proj_name} | Files: {len(files)} | Entry: {entry_point}")
     if speak: speak(f"I have planned {len(files)} files for the {proj_name} project. I will now start writing the code.")
 
@@ -473,6 +479,12 @@ def _build_project(
         return len(fi.get("imports", []))
 
     sorted_files = sorted(files, key=_dep_sort_key)
+    
+    if player and hasattr(player, "add_project_task"):
+        for fi in sorted_files:
+            fp = fi.get("path")
+            if fp:
+                player.add_project_task(fp, f"Write file: {fp}")
 
     file_codes: dict[str, str] = {}
 
@@ -482,6 +494,11 @@ def _build_project(
             continue
 
         log(f"Writing {file_path}...")
+        if player and hasattr(player, "update_project_task"):
+            player.update_project_task(file_path, "in_progress")
+        if player and hasattr(player, "log_project_terminal"):
+            player.log_project_terminal(f"> Generating code for {file_path}...")
+
         if speak and idx > 0 and idx % 3 == 0:
             speak(f"Still working on it, sir. Currently writing {file_path}.")
             
@@ -496,16 +513,28 @@ def _build_project(
                     already_written=file_codes,
                 )
                 file_codes[file_path] = code
+                if player and hasattr(player, "update_project_task"):
+                    player.update_project_task(file_path, "completed")
+                if player and hasattr(player, "log_project_terminal"):
+                    player.log_project_terminal(f"✓ {file_path} written successfully.")
                 time.sleep(0.4)
                 break
             except RateLimitError:
                 if attempt == 0:
                     log("Rate limit — waiting 20s...")
+                    if player and hasattr(player, "log_project_terminal"):
+                        player.log_project_terminal("! Rate limit reached. Waiting 20 seconds...")
                     time.sleep(20)
                 else:
                     log(f"Rate limit retry failed for {file_path}, skipping.")
+                    if player and hasattr(player, "update_project_task"):
+                        player.update_project_task(file_path, "failed")
             except Exception as e:
                 log(f"Failed to write {file_path}: {e}")
+                if player and hasattr(player, "update_project_task"):
+                    player.update_project_task(file_path, "failed")
+                if player and hasattr(player, "log_project_terminal"):
+                    player.log_project_terminal(f"x Error writing {file_path}: {e}")
                 break
 
     if not file_codes:
@@ -515,8 +544,12 @@ def _build_project(
 
     if dependencies:
         if speak: speak("Installing required dependencies now, sir.")
+        if player and hasattr(player, "log_project_terminal"):
+            player.log_project_terminal(f"> Installing dependencies: {', '.join(dependencies)}")
         install_result = _install_dependencies(dependencies, project_dir)
         log(install_result)
+        if player and hasattr(player, "log_project_terminal"):
+            player.log_project_terminal(f"Dependency install result:\n{install_result}")
 
     _open_vscode(project_dir)
 
@@ -527,8 +560,15 @@ def _build_project(
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
+        if player and hasattr(player, "log_project_terminal"):
+            player.log_project_terminal(f"\n--- Execution Attempt {attempt}/{MAX_FIX_ATTEMPTS} ---")
+            player.log_project_terminal(f"$ {run_command}")
+        
         last_output = _run_project(run_command, project_dir, timeout)
         log(f"Output preview: {last_output[:150]}")
+        
+        if player and hasattr(player, "log_project_terminal"):
+            player.log_project_terminal(f"Output:\n{last_output}")
 
         if not _has_error(last_output, run_command):
             msg = (
@@ -536,6 +576,8 @@ def _build_project(
                 f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
                 f"Saved to: {project_dir}"
             )
+            if player and hasattr(player, "log_project_terminal"):
+                player.log_project_terminal("\n✓ PROJECT COMPLETED SUCCESSFULLY.")
             if speak: speak(msg)
             return f"{msg}\n\nOutput:\n{last_output}"
 

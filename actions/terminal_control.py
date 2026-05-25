@@ -21,6 +21,9 @@ def terminal_control(parameters: dict, player=None, speak=None) -> str:
         player.write_log(f"[Terminal] {command[:60]}")
         
     # Handle cd commands to maintain state
+    if command.strip() == "pwd":
+        return f"Current directory is: {_CURRENT_DIR}"
+
     if command.strip().startswith("cd "):
         target = command.strip()[3:].strip()
         

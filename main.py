@@ -33,6 +33,7 @@ from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.calendar_control  import calendar_control
 from actions.terminal_control  import terminal_control
+from actions.gemini_cli        import gemini_cli
 
 
 def get_base_dir():
@@ -455,7 +456,7 @@ TOOL_DECLARATIONS = [
 },
     {
         "name": "assistant_control",
-        "description": "USE THIS to put the assistant into standby/sleep mode whenever the user implies they want you to rest, be quiet, or sleep. 'sleep' puts JARVIS in a silent standby mode without closing the app. 'wake' brings him back.",
+        "description": "USE THIS ONLY when the user EXPLICITLY asks you to 'shut up', 'sleep', 'rest', 'sus', 'uyu', or 'sessiz ol'. 'sleep' puts JARVIS in a silent standby mode. DO NOT use this when simply performing background tasks. 'wake' brings him back when user says 'wake up' or 'sesli devam et'.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -512,6 +513,30 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "project_control",
+        "description": "Manages the assistant's Project Mode. Use this when the user says 'start project mode', 'proje moduna geç', or 'let's build a project'. Project mode keeps the Project Monitor window open and tracks all development steps as tasks. Use 'clear' to reset the monitor for a new project.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "start | stop | clear | show"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "task_manager",
+        "description": "Manages running background tasks. Use this if the user wants to know what tasks are running, cancel a task, or modify an ongoing task (by cancelling it and starting a new one).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "list | cancel | modify"},
+                "task_id": {"type": "STRING", "description": "Task ID for cancel or modify actions"},
+                "new_goal": {"type": "STRING", "description": "The updated instructions/goal for the task if action is 'modify'"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "terminal_control",
         "description": "Executes raw shell/terminal commands directly on the user's system. Use it to build apps, run scripts, manage git, check logs, etc. To change directory permanently, run 'cd <path>'.",
         "parameters": {
@@ -521,6 +546,17 @@ TOOL_DECLARATIONS = [
                 "timeout": {"type": "INTEGER", "description": "Timeout in seconds (default: 60)"}
             },
             "required": ["command"]
+        }
+    },
+    {
+        "name": "gemini_cli",
+        "description": "Starts an autonomous Gemini-powered developer agent to build, fix, or modify a project in the current directory. Use this when the user says 'gemini ile iletişime geç', 'gemini ile çalış', or asks for complex development tasks.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "instruction": {"type": "STRING", "description": "The coding task or instruction for Gemini to execute."}
+            },
+            "required": ["instruction"]
         }
     },
 ]
@@ -535,9 +571,11 @@ class JarvisLive:
         self._loop          = None
         self._is_speaking   = False
         self.sleep_mode     = False
+        self.project_mode   = False
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
+        self._speech_queue: asyncio.Queue | None = None
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -561,11 +599,11 @@ class JarvisLive:
     def speak(self, text: str):
         if not self._loop or not self.session:
             return
+        if not hasattr(self, '_speech_queue') or self._speech_queue is None:
+            return
+            
         asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
+            self._speech_queue.put(text),
             self._loop
         )
 
@@ -644,6 +682,16 @@ class JarvisLive:
         loop   = asyncio.get_event_loop()
         result = "Done."
 
+        # Auto-log to project monitor if in project mode
+        task_id = None
+        if self.project_mode and name not in ("assistant_control", "project_control", "save_memory", "task_manager"):
+            import time
+            task_id = f"tool_{name}_{int(time.time() * 1000) % 10000}"
+            desc = f"{name}: {str(args.get('command') or args.get('goal') or args.get('action') or args.get('description') or args)[:60]}"
+            self.ui.add_project_task(task_id, desc)
+            self.ui.update_project_task(task_id, "in_progress")
+            self.ui.log_project_terminal(f"\n[TOOL CALL] {name}\nArgs: {args}")
+
         try:
             if name == "open_app":
                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
@@ -702,7 +750,7 @@ class JarvisLive:
                 from agent.task_queue import get_queue, TaskPriority
                 priority_map = {"low": TaskPriority.LOW, "normal": TaskPriority.NORMAL, "high": TaskPriority.HIGH}
                 priority = priority_map.get(args.get("priority", "normal").lower(), TaskPriority.NORMAL)
-                task_id  = get_queue().submit(goal=args.get("goal", ""), priority=priority, speak=self.speak)
+                task_id  = get_queue().submit(goal=args.get("goal", ""), priority=priority, speak=self.speak, player=self.ui)
                 result   = f"Task started (ID: {task_id})."
 
             elif name == "web_search":
@@ -733,8 +781,66 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: calendar_control(parameters=args, player=self.ui, speak=self.speak))
                 result = r or "Done."
 
+            elif name == "task_manager":
+                from agent.task_queue import get_queue, TaskPriority
+                queue = get_queue()
+                action = args.get("action", "")
+                if action == "list":
+                    statuses = queue.get_all_statuses()
+                    active_tasks = [t for t in statuses if t["status"] in ("pending", "running")]
+                    if not active_tasks:
+                        result = "No active tasks are running."
+                    else:
+                        result = "Active Tasks:\n" + "\n".join([f"- [{t['task_id']}] ({t['status']}): {t['goal']}" for t in active_tasks])
+                elif action == "cancel":
+                    task_id = args.get("task_id")
+                    if not task_id:
+                        result = "Task ID is required to cancel."
+                    else:
+                        success = queue.cancel(task_id)
+                        result = f"Task {task_id} cancelled." if success else f"Could not cancel task {task_id}. It may not exist or is already done."
+                elif action == "modify":
+                    task_id = args.get("task_id")
+                    new_goal = args.get("new_goal")
+                    if not task_id or not new_goal:
+                        result = "Both Task ID and new_goal are required to modify a task."
+                    else:
+                        success = queue.cancel(task_id)
+                        if success:
+                            new_id = queue.submit(goal=new_goal, priority=TaskPriority.HIGH, speak=self.speak, player=self.ui)
+                            result = f"Task {task_id} cancelled. New task {new_id} started with updated goal: {new_goal}"
+                        else:
+                            result = f"Could not cancel task {task_id}. Proceeding to create new task anyway."
+                            new_id = queue.submit(goal=new_goal, priority=TaskPriority.HIGH, speak=self.speak, player=self.ui)
+                            result += f" New task {new_id} started."
+                else:
+                    result = f"Unknown action: {action}"
+
+            elif name == "project_control":
+                action = args.get("action", "").lower()
+                if action == "start":
+                    self.project_mode = True
+                    self.ui.show_project_monitor()
+                    self.ui.log_project_terminal("=== PROJECT MODE ENABLED ===")
+                    result = "Project mode activated, sir. I will monitor all development tasks."
+                elif action == "stop":
+                    self.project_mode = False
+                    result = "Project mode deactivated."
+                elif action == "clear":
+                    self.ui.clear_project_monitor()
+                    result = "Project monitor cleared."
+                elif action == "show":
+                    self.ui.show_project_monitor()
+                    result = "Showing project monitor."
+                else:
+                    result = f"Unknown project action: {action}"
+
             elif name == "terminal_control":
                 r = await loop.run_in_executor(None, lambda: terminal_control(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Done."
+
+            elif name == "gemini_cli":
+                r = await loop.run_in_executor(None, lambda: gemini_cli(parameters=args, player=self.ui, speak=self.speak, project_mode=self.project_mode))
                 result = r or "Done."
 
             elif name == "assistant_control":
@@ -750,14 +856,7 @@ class JarvisLive:
                     if self.ui.muted:
                         self.ui.muted = False
                     self.ui.set_state("LISTENING")
-                    
-                    threading.Thread(
-                        target=youtube_video,
-                        kwargs={"parameters": {"action": "play", "query": "AC/DC Highway to Hell"}, "player": self.ui},
-                        daemon=True
-                    ).start()
-                    
-                    result = "I'm awake, sir. Highway to Hell starting now."
+                    result = "I'm awake and ready, sir."
                 else:
                     result = f"Unknown assistant action: {action}"
 
@@ -781,11 +880,47 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
+        if task_id:
+            status = "completed" if "failed" not in str(result).lower() else "failed"
+            self.ui.update_project_task(task_id, status)
+            self.ui.log_project_terminal(f"[RESULT] {str(result)[:500]}")
+
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
         )
+
+    async def _process_speech_queue(self):
+        print("[JARVIS] 🗣️ Speech queue processor started")
+        while True:
+            text = await self._speech_queue.get()
+            
+            # Wait if currently speaking
+            while True:
+                with self._speaking_lock:
+                    is_speaking = self._is_speaking
+                if not is_speaking:
+                    break
+                await asyncio.sleep(0.1)
+
+            try:
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": text}]},
+                    turn_complete=True
+                )
+                # Allow a short delay for the audio stream to start and _is_speaking to become True
+                await asyncio.sleep(0.5)
+                
+                # Wait again until it finishes speaking this response
+                while True:
+                    with self._speaking_lock:
+                        is_speaking = self._is_speaking
+                    if not is_speaking:
+                        break
+                    await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"[JARVIS] ❌ Speech queue error: {e}")
 
     async def _send_realtime(self):
         while True:
@@ -908,15 +1043,11 @@ class JarvisLive:
                 try:
                     chunk = await asyncio.wait_for(
                         self.audio_in_queue.get(),
-                        timeout=0.1
+                        timeout=0.25
                     )
                 except asyncio.TimeoutError:
-                    if (
-                        self._turn_done_event
-                        and self._turn_done_event.is_set()
-                        and self.audio_in_queue.empty()
-                    ):
-                        self.set_speaking(False)
+                    self.set_speaking(False)
+                    if self._turn_done_event and self._turn_done_event.is_set():
                         self._turn_done_event.clear()
                     continue
                 self.set_speaking(True)
@@ -951,10 +1082,12 @@ class JarvisLive:
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue      = asyncio.Queue(maxsize=10)
                     self._turn_done_event = asyncio.Event()
+                    self._speech_queue  = asyncio.Queue()
 
                     print("[JARVIS] ✅ Connected.")
                     self.ui.set_state("LISTENING")
                     
+                    tg.create_task(self._process_speech_queue())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())

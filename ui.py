@@ -25,7 +25,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
-    QVBoxLayout, QWidget, QProgressBar,
+    QVBoxLayout, QWidget, QProgressBar, QListWidget, QListWidgetItem
 )
 
 def _base_dir() -> Path:
@@ -990,6 +990,11 @@ class SetupOverlay(QWidget):
 class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)
     _state_sig = pyqtSignal(str)
+    _pm_show_sig = pyqtSignal()
+    _pm_add_task_sig = pyqtSignal(str, str)
+    _pm_update_task_sig = pyqtSignal(str, str)
+    _pm_log_term_sig = pyqtSignal(str)
+    _pm_clear_sig = pyqtSignal()
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1006,6 +1011,7 @@ class MainWindow(QMainWindow):
         self.on_text_command  = None
         self._muted           = False
         self._current_file: str | None = None
+        self._project_monitor = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1046,6 +1052,12 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        
+        self._pm_show_sig.connect(self._do_show_pm)
+        self._pm_add_task_sig.connect(self._do_add_pm_task)
+        self._pm_update_task_sig.connect(self._do_update_pm_task)
+        self._pm_log_term_sig.connect(self._do_log_pm_term)
+        self._pm_clear_sig.connect(self._do_clear_pm)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -1056,6 +1068,29 @@ class MainWindow(QMainWindow):
         sc_mute.activated.connect(self._toggle_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
+
+    def _do_show_pm(self):
+        if not self._project_monitor:
+            self._project_monitor = ProjectMonitorWindow()
+        self._project_monitor.show()
+        self._project_monitor.raise_()
+        self._project_monitor.activateWindow()
+
+    def _do_add_pm_task(self, task_id: str, desc: str):
+        self._do_show_pm()
+        self._project_monitor._add_task(task_id, desc)
+
+    def _do_update_pm_task(self, task_id: str, status: str):
+        self._do_show_pm()
+        self._project_monitor._update_task(task_id, status)
+
+    def _do_log_pm_term(self, text: str):
+        self._do_show_pm()
+        self._project_monitor._log_term(text)
+
+    def _do_clear_pm(self):
+        if self._project_monitor:
+            self._project_monitor._clear()
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1289,6 +1324,22 @@ class MainWindow(QMainWindow):
         self._mute_btn.clicked.connect(self._toggle_mute)
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
+        
+        self._intervene_btn = QPushButton("✋  INTERVENE / MODIFY")
+        self._intervene_btn.setFixedHeight(30)
+        self._intervene_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._intervene_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._intervene_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.ACC};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                color: {C.ACC2}; border: 1px solid {C.ACC};
+            }}
+        """)
+        self._intervene_btn.clicked.connect(self._trigger_intervention)
+        lay.addWidget(self._intervene_btn)
 
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
@@ -1372,6 +1423,12 @@ class MainWindow(QMainWindow):
                 f"Briefly tell the user you can see the file '{p.name}' "
                 f"({size}) has been uploaded and ask what they'd like to do with it."
             )
+            threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
+
+    def _trigger_intervention(self):
+        self._log.append_log("SYS: Intervention requested.")
+        if self.on_text_command:
+            msg = "[SYSTEM_INTERVENTION] The user has pressed the INTERVENE button to modify or interrupt your current actions. Pause what you are doing, acknowledge the interruption, and ask the user how they want to modify the current background tasks or what they want to change."
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
     def _toggle_mute(self):
@@ -1459,6 +1516,96 @@ class _RootShim:
         pass
 
 
+class ProjectMonitorWindow(QWidget):
+    _add_task_sig = pyqtSignal(str, str)
+    _update_task_sig = pyqtSignal(str, str)
+    _log_term_sig = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DEV AGENT - Project Monitor")
+        self.resize(800, 600)
+        self.setStyleSheet(f"background: {C.BG}; color: {C.WHITE};")
+        
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+
+        # Left side - Tasks
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        task_lbl = QLabel("PROJECT TASKS")
+        task_lbl.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        task_lbl.setStyleSheet(f"color: {C.PRI};")
+        left_layout.addWidget(task_lbl)
+        
+        self.task_list = QListWidget()
+        self.task_list.setFont(QFont("Courier New", 9))
+        self.task_list.setStyleSheet(f"""
+            QListWidget {{ background: {C.PANEL}; border: 1px solid {C.BORDER}; padding: 5px; }}
+            QListWidget::item {{ margin-bottom: 4px; }}
+        """)
+        left_layout.addWidget(self.task_list)
+        main_layout.addWidget(left_panel, stretch=1)
+
+        # Right side - Terminal
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        term_lbl = QLabel("TERMINAL OUTPUT")
+        term_lbl.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        term_lbl.setStyleSheet(f"color: {C.ACC};")
+        right_layout.addWidget(term_lbl)
+        
+        self.terminal = QTextEdit()
+        self.terminal.setReadOnly(True)
+        self.terminal.setFont(QFont("Courier New", 9))
+        self.terminal.setStyleSheet(f"""
+            QTextEdit {{ background: #000; color: #0f0; border: 1px solid {C.BORDER}; padding: 5px; }}
+        """)
+        right_layout.addWidget(self.terminal)
+        main_layout.addWidget(right_panel, stretch=2)
+
+        self._add_task_sig.connect(self._add_task)
+        self._update_task_sig.connect(self._update_task)
+        self._log_term_sig.connect(self._log_term)
+
+    def _add_task(self, task_id: str, desc: str):
+        item = QListWidgetItem(f"[ ] {desc}")
+        item.setData(Qt.ItemDataRole.UserRole, task_id)
+        item.setForeground(QBrush(qcol(C.TEXT_DIM)))
+        self.task_list.addItem(item)
+
+    def _update_task(self, task_id: str, status: str):
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == task_id:
+                old_text = item.text()
+                desc = old_text[4:] if len(old_text) > 4 else old_text
+                if status == "in_progress":
+                    item.setText(f"[>] {desc}")
+                    item.setForeground(QBrush(qcol(C.ACC2)))
+                elif status == "completed":
+                    item.setText(f"[x] {desc}")
+                    item.setForeground(QBrush(qcol(C.GREEN)))
+                elif status == "failed":
+                    item.setText(f"[!] {desc}")
+                    item.setForeground(QBrush(qcol(C.RED)))
+                break
+
+    def _log_term(self, text: str):
+        self.terminal.append(text)
+        self.terminal.moveCursor(self.terminal.textCursor().MoveOperation.End)
+
+    def _clear(self):
+        self.task_list.clear()
+        self.terminal.clear()
+        self.terminal.append("=== MONITOR RESET ===")
+
+
 class JarvisUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
@@ -1466,6 +1613,21 @@ class JarvisUI:
         self._win = MainWindow(face_path)
         self._win.show()
         self.root = _RootShim(self._app)
+
+    def show_project_monitor(self):
+        self._win._pm_show_sig.emit()
+
+    def add_project_task(self, task_id: str, desc: str):
+        self._win._pm_add_task_sig.emit(task_id, desc)
+
+    def update_project_task(self, task_id: str, status: str):
+        self._win._pm_update_task_sig.emit(task_id, status)
+
+    def log_project_terminal(self, text: str):
+        self._win._pm_log_term_sig.emit(text)
+
+    def clear_project_monitor(self):
+        self._win._pm_clear_sig.emit()
 
     @property
     def muted(self) -> bool:

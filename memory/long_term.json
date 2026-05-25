@@ -1,0 +1,26 @@
+{
+  "identity": {
+    "language": {
+      "value": "Turkish",
+      "updated": "2026-05-21"
+    },
+    "current_local_time": {
+      "value": "7:00 PM",
+      "updated": "2026-05-22"
+    },
+    "name": {
+      "value": "Mert",
+      "updated": "2026-05-22"
+    }
+  },
+  "preferences": {
+    "wake_up_music_behavior": {
+      "value": "A specific music starts playing when the assistant wakes up.",
+      "updated": "2026-05-24"
+    }
+  },
+  "projects": {},
+  "relationships": {},
+  "wishes": {},
+  "notes": {}
+}

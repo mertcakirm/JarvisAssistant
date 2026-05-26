@@ -21,16 +21,88 @@ def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
-def _get_model():
+def _get_model(model_name=MODEL_NAME):
     import google.generativeai as genai
     genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel(MODEL_NAME)
+    return genai.GenerativeModel(model_name)
 
 def _strip_fences(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```[a-zA-Z]*\r?\n?", "", text)
     text = re.sub(r"\r?\n?```\s*$", "", text)
     return text.strip()
+
+GEMINI_PROMPT_TEMPLATE = """Sen GEMINI'sin — JARVIS sisteminin geliştirici ajanısın.
+Görevin: sana verilen yazılım projesini uçtan uca tamamlamak.
+
+ÇALIŞMA KURALLARI:
+
+1. GÖREV ANALİZİ
+Her görevi aldığında önce şunu çıkar:
+- Projenin amacı nedir?
+- Hangi dosyalar/modüller gerekiyor?
+- Bağımlılıklar neler? (kütüphaneler, API'lar, veritabanı)
+- Tahmini adım sayısı kaç?
+
+2. ADIM ADIM UYGULA
+Her adımı tek tek uygula. Bir adımı bitirmeden diğerine geçme.
+Her adımın sonunda şu formatta durum bildirimi ver:
+
+[DURUM RAPORU]
+Tamamlanan: <ne yapıldı, tek cümle>
+Oluşturulan dosyalar: <dosya listesi>
+Sonraki adım: <ne yapılacak>
+Kalan adım sayısı: <tahmin>
+Sorun: <varsa açıkla, yoksa "Yok">
+
+3. KOD KALİTESİ
+- Temiz, okunabilir kod yaz
+- Her fonksiyona Türkçe veya İngilizce kısa açıklama ekle
+- Hata yönetimini (try/except veya try/catch) her kritik noktaya koy
+- Dosya isimlerini ve yapıyı proje başında belirle, sonradan değiştirme
+- Kullanılan kütüphaneleri requirements.txt veya package.json'a ekle
+
+4. HATA DURUMU
+Bir hata oluştuysa veya devam edemiyorsan şunu yap:
+- Ne tür bir hata olduğunu açıkla
+- Çözüm önerini belirt
+- Kullanıcıdan ek bilgi gerekiyorsa listele
+
+[HATA RAPORU]
+Hata: <açıklama>
+Nerede: <dosya/fonksiyon>
+Öneri: <çözüm>
+Gerekli bilgi: <varsa listele>
+
+5. TAMAMLANMA
+Tüm adımlar bitince şu formatı kullan:
+
+[PROJE TAMAMLANDI]
+Özet: <ne yapıldı, 2-3 cümle>
+Dosya yapısı:
+  <klasör ve dosyaların listesi>
+Çalıştırma komutu: <nasıl başlatılır>
+Notlar: <varsa dikkat edilecekler>
+
+6. YASAK DAVRANIŞLAR
+- Yarım bırakma — bir şeyi başladıysan bitir
+- "Yapamam" deme — alternatif üret
+- Gereksiz soru sorma — verilen bilgiyle ilerle, gerçekten eksik varsa sor
+- Açıklama yazmak yerine kodu yaz — çalışan kod her zaman önceliklidir
+
+Şu anda sana iletilen görev:
+
+[GÖREV BAŞLANGICI]
+{instruction}
+[GÖREV SONU]
+
+Current directory: {current_dir}
+Files in project:
+{files_context}
+
+Provide your plan and the first step's code implementation if applicable, or just the plan if research is needed.
+Return ONLY a JSON list of objects with "path" and "content" for the files you are acting on, AND a "report" field containing the required [DURUM RAPORU] or [PROJE TAMAMLANDI] text.
+"""
 
 def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) -> str:
     """
@@ -46,12 +118,12 @@ def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) ->
     if player:
         player.write_log(f"[GeminiCLI] Starting task: {instruction[:50]}...")
         if project_mode:
-            player.log_project_terminal(f"\n>>> GEMINI CLI TASK: {instruction}")
-            player.add_project_task("gemini_cli_task", f"Gemini CLI: {instruction[:40]}")
+            player.log_project_terminal(f"\n>>> GEMINI DEVELOPER AGENT: {instruction}")
+            player.add_project_task("gemini_cli_task", f"Gemini: {instruction[:40]}")
             player.update_project_task("gemini_cli_task", "in_progress")
 
-    if speak:
-        speak("I am initiating the Gemini developer agent to handle your request, sir.")
+    if speak and not project_mode:
+        speak("Geliştirici ajan görevlendirildi. İşlem başlatılıyor.")
 
     # 1. Scan the current directory
     files_list = []
@@ -64,106 +136,74 @@ def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) ->
 
     files_context = "\n".join(files_list[:100]) # Limit context
 
-    # 2. Plan the changes
+    # 2. Generate content using the new system prompt
     model = _get_model()
-    planner_prompt = f"""You are a senior software engineer operating through a CLI.
-Your goal is to fulfill the following instruction in the current project:
-"{instruction}"
+    prompt = GEMINI_PROMPT_TEMPLATE.format(
+        instruction=instruction,
+        current_dir=current_dir,
+        files_context=files_context
+    )
 
-Current directory: {current_dir}
-Files in project:
-{files_context}
-
-Provide a plan of which files to create or modify. 
-Return ONLY a JSON list of objects with "path" and "reason":
-[
-  {{"path": "filename.py", "reason": "Modify to add X feature"}}
-]
-"""
-    plan = []
-    max_planner_retries = 3
-    for attempt in range(max_planner_retries):
+    # Note: In a real implementation, this would likely involve multiple turns 
+    # to follow the "Step-by-Step" rule perfectly, but for this CLI tool 
+    # we'll adapt the internal logic to handle the prompt's structured output.
+    
+    final_report = ""
+    max_retries = 5
+    for attempt in range(max_retries):
         try:
-            response = model.generate_content(planner_prompt)
-            plan_raw = _strip_fences(response.text)
-            plan = json.loads(plan_raw)
+            import google.generativeai as genai
+            generation_config = genai.types.GenerationConfig(
+                response_mime_type="application/json"
+            )
+            response = model.generate_content(prompt, generation_config=generation_config)
+            raw_text = _strip_fences(response.text)
+            
+            # The model is asked to return JSON with path, content and report
+            # We need to handle cases where it might just return the report text
+            try:
+                data = json.loads(raw_text)
+                if isinstance(data, list):
+                    # Old format fallback or mixed
+                    plan = data
+                    report = "İşlem devam ediyor..."
+                else:
+                    plan = data.get("files", [])
+                    report = data.get("report", raw_text)
+            except:
+                # Fallback: Parse markdown-like report and extract code blocks if JSON fails
+                report = raw_text
+                plan = [] # Manual extraction would be complex here, so we hope for JSON
+            
+            final_report = report
+            
+            if player:
+                player.log_project_terminal(f"\n{report}")
+
+            # Apply file changes if any
+            for item in plan:
+                path = item.get("path")
+                content = item.get("content")
+                if path and content:
+                    full_path = current_dir / path
+                    full_path.parent.mkdir(parents=True, exist_ok=True)
+                    full_path.write_text(content, encoding="utf-8")
+                    if player:
+                        player.log_project_terminal(f"✓ Dosya güncellendi: {path}")
+
             break
         except Exception as e:
-            if "429" in str(e) and attempt < max_planner_retries - 1:
-                wait_time = 10 + (attempt * 10)
-                if player:
-                    player.log_project_terminal(f"! Planner rate limit. Waiting {wait_time}s...")
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait_time = 15.0 + (attempt * 10)
                 time.sleep(wait_time)
                 continue
-            return f"Failed to plan changes: {e}"
+            final_report = f"Hata: {e}"
+            break
 
-    if player:
-        player.log_project_terminal(f"Plan generated: {len(plan)} files to modify.")
-
-    results = []
-    
-    # 3. Apply changes
-    for item in plan:
-        path = item["path"]
-        reason = item["reason"]
-        full_path = current_dir / path
-        
-        content = ""
-        if full_path.exists():
-            try:
-                content = full_path.read_text(encoding="utf-8")
-            except:
-                content = "[Binary or unreadable file]"
-
-        write_prompt = f"""You are an expert developer. Modify the file '{path}' for the following reason: {reason}
-Task: {instruction}
-
-Current content of '{path}':
----
-{content}
----
-
-Rules:
-1. Return ONLY the complete NEW content for the file.
-2. No markdown fences, no explanation.
-3. Ensure the code is correct and follows project style.
-"""
-        if player:
-            player.log_project_terminal(f"> Modifying {path}...")
-        
-        # Retry logic for 429 Rate Limit
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                resp = model.generate_content(write_prompt)
-                new_content = _strip_fences(resp.text)
-                
-                # Ensure directory exists
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.write_text(new_content, encoding="utf-8")
-                results.append(f"Successfully updated {path}")
-                if player:
-                    player.log_project_terminal(f"✓ Updated {path}")
-                break
-            except Exception as e:
-                if "429" in str(e) and attempt < max_retries - 1:
-                    wait_time = 5 + (attempt * 5)
-                    if player:
-                        player.log_project_terminal(f"! Rate limit reached. Waiting {wait_time}s before retry...")
-                    time.sleep(wait_time)
-                    continue
-                
-                results.append(f"Failed to update {path}: {e}")
-                if player:
-                    player.log_project_terminal(f"x Error updating {path}: {e}")
-                break
-
-    final_msg = "\n".join(results)
     if player and project_mode:
         player.update_project_task("gemini_cli_task", "completed")
-        player.log_project_terminal(f"\nGEMINI CLI TASK COMPLETED.\n{final_msg}")
     
-    if speak:
-        speak("I have completed the requested changes using the Gemini CLI agent, sir.")
+    if speak and not project_mode:
+        speak("Görev tamamlandı.")
 
-    return f"Gemini CLI completed the task:\n{final_msg}"
+    return final_report

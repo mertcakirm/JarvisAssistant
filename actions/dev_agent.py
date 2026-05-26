@@ -447,10 +447,19 @@ def _build_project(
     if speak: speak("Planning the project structure, sir. Please give me a moment.")
     try:
         plan = _plan_project(description, language)
-    except RateLimitError:
-        msg = "Rate limit reached, sir. Please try again in a moment."
+    except RateLimitError as e:
+        import re
+        msg_str = str(e)
+        match = re.search(r"retry in ([\d\.]+)s", msg_str)
+        wait_time = float(match.group(1)) + 1.0 if match else 20.0
+        msg = f"Rate limit reached, sir. Waiting {wait_time:.1f}s before trying again..."
+        log(msg)
         if speak: speak(msg)
-        return msg
+        time.sleep(wait_time)
+        try:
+            plan = _plan_project(description, language)
+        except Exception as e2:
+            return f"Planning failed after retry: {e2}"
     except ValueError as e:
         msg = f"Planning failed: {e}"
         if speak: speak(msg)
@@ -519,12 +528,16 @@ def _build_project(
                     player.log_project_terminal(f"✓ {file_path} written successfully.")
                 time.sleep(0.4)
                 break
-            except RateLimitError:
+            except RateLimitError as e:
+                import re
                 if attempt == 0:
-                    log("Rate limit — waiting 20s...")
+                    msg_str = str(e)
+                    match = re.search(r"retry in ([\d\.]+)s", msg_str)
+                    wait_time = float(match.group(1)) + 1.0 if match else 20.0
+                    log(f"Rate limit — waiting {wait_time:.1f}s...")
                     if player and hasattr(player, "log_project_terminal"):
-                        player.log_project_terminal("! Rate limit reached. Waiting 20 seconds...")
-                    time.sleep(20)
+                        player.log_project_terminal(f"! Rate limit reached. Waiting {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
                 else:
                     log(f"Rate limit retry failed for {file_path}, skipping.")
                     if player and hasattr(player, "update_project_task"):
@@ -612,10 +625,19 @@ def _build_project(
             )
             file_codes.update(updated)
             time.sleep(1)
-        except RateLimitError:
-            msg = "Rate limit reached during fix. Project saved, check it manually in VSCode."
-            if speak: speak(msg)
-            return msg
+        except RateLimitError as e:
+            import re
+            msg_str = str(e)
+            match = re.search(r"retry in ([\d\.]+)s", msg_str)
+            wait_time = float(match.group(1)) + 1.0 if match else 20.0
+            msg = f"Rate limit reached during fix. Waiting {wait_time:.1f}s before next attempt."
+            log(msg)
+            if player and hasattr(player, "log_project_terminal"):
+                player.log_project_terminal(f"! Rate limit. Waiting {wait_time:.1f}s...")
+            time.sleep(wait_time)
+            # Will retry in the next loop iteration, but we might have lost this attempt.
+            # It's fine since MAX_FIX_ATTEMPTS is 5.
+            continue
         except Exception as e:
             log(f"Fix step failed: {e}")
 

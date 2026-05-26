@@ -34,6 +34,7 @@ from actions.game_updater      import game_updater
 from actions.calendar_control  import calendar_control
 from actions.terminal_control  import terminal_control
 from actions.gemini_cli        import gemini_cli
+from actions.dev_orchestrator  import dev_manager
 
 
 def get_base_dir():
@@ -559,6 +560,17 @@ TOOL_DECLARATIONS = [
             "required": ["instruction"]
         }
     },
+    {
+        "name": "development_mode",
+        "description": "Enters a specialized Development Mode where JARVIS works with a background Multi-Agent orchestrator (Gemini CLI) to build complex software. Use this for deep coding sessions or when starting a new large project idea.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "instruction": {"type": "STRING", "description": "The project idea or initial coding instruction."}
+            },
+            "required": ["instruction"]
+        }
+    },
 ]
 
 class JarvisLive:
@@ -843,6 +855,40 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: gemini_cli(parameters=args, player=self.ui, speak=self.speak, project_mode=self.project_mode))
                 result = r or "Done."
 
+            elif name == "development_mode":
+                instruction = args.get("instruction", "")
+                if not instruction:
+                    result = "No instruction provided for Development Mode."
+                else:
+                    self.project_mode = True
+                    self.ui.show_project_monitor()
+                    self.ui.log_project_terminal(f"\n=== GELİŞTİRME MODU AKTİF ===")
+                    self.ui.log_project_terminal(f"Hedef: {instruction}")
+                    
+                    if not self.ui.muted:
+                        self.speak("Anladım, görevi Gemini'ye aktarıyorum.")
+
+                    # Arka planda dev_manager'ı başlat ve prompt gönder
+                    await dev_manager.start_session()
+                    
+                    # Görevi arka planda yürütmek için bir task oluşturuyoruz ki ana loop bloklanmasın
+                    async def run_dev_task():
+                        self.ui.add_project_task("dev_orchestrator", "Gemini Geliştirici")
+                        self.ui.update_project_task("dev_orchestrator", "in_progress")
+                        
+                        full_response = []
+                        async for chunk in dev_manager.send_prompt(instruction, player=self.ui, speak=self.speak):
+                            self.ui.log_project_terminal(chunk)
+                            full_response.append(chunk)
+                        
+                        self.ui.update_project_task("dev_orchestrator", "completed")
+                        self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ TAMAMLANDI ===")
+                        if not self.ui.muted:
+                            self.speak("Proje tamamlandı. Gemini görevlerini bitirdi. Detaylar için Proje Monitörüne bakabilirsiniz.")
+
+                    asyncio.create_task(run_dev_task())
+                    result = "Development mode activated. Orchestrator is working in the background."
+
             elif name == "assistant_control":
                 action = args.get("action", "").lower()
                 if action == "sleep":
@@ -863,6 +909,10 @@ class JarvisLive:
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
+                
+                # Dev session temizliği
+                asyncio.create_task(dev_manager.stop_session())
+
                 def _shutdown():
                     import time, os
                     time.sleep(1)

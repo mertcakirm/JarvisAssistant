@@ -72,10 +72,22 @@ def _load_system_prompt() -> str:
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
-def _clean_transcript(text: str) -> str:    
+def _clean_transcript(text: str) -> str:
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
+
+def _requires_development_mode(instruction: str) -> bool:
+    low = (instruction or "").lower()
+    setup_terms = (
+        "create", "setup", "set up", "install", "configure", "build",
+        "oluştur", "kur", "yapılandır", "proje",
+    )
+    project_terms = (
+        "vite", "react project", "react vite", "npm", "npx",
+        "tailwind", "react router", "helmet", "package.json", "node_modules",
+    )
+    return any(term in low for term in setup_terms) and any(term in low for term in project_terms)
 
 TOOL_DECLARATIONS = [
     {
@@ -515,7 +527,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "project_control",
-        "description": "Manages the assistant's Project Mode. Use this when the user says 'start project mode', 'proje moduna geç', or 'let's build a project'. Project mode keeps the Project Monitor window open and tracks all development steps as tasks. Use 'clear' to reset the monitor for a new project.",
+        "description": "Manages the assistant's Project Mode. Use this before Gemini-led development, when the user says 'start project mode', 'proje moduna geç', 'gemini ile çalış', or 'let's build a project'. Project mode makes JARVIS the project manager, keeps the Project Monitor open, and tracks all development steps as tasks. Use 'clear' to reset the monitor for a new project.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -551,7 +563,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "gemini_cli",
-        "description": "Starts an autonomous Gemini-powered developer agent to build, fix, or modify a project in the current directory. Use this when the user says 'gemini ile iletişime geç', 'gemini ile çalış', or asks for complex development tasks.",
+        "description": "Delegates a bounded source-code edit to the Gemini developer agent in the current directory. Do NOT use this for creating Vite/React projects, npm/npx installs, Tailwind setup, package.json generation, or multi-step project bootstrapping; use development_mode for those. JARVIS remains the project manager and must track Gemini's status.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -562,7 +574,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "development_mode",
-        "description": "Enters a specialized Development Mode where JARVIS works with a background Multi-Agent orchestrator (Gemini CLI) to build complex software. Use this for deep coding sessions or when starting a new large project idea.",
+        "description": "Enters Development Mode where JARVIS is the project manager and Gemini CLI is the developer agent. Use this for Vite/React project creation, npm/npx installs, Tailwind setup, package.json work, Gemini-led coding sessions, complex fixes, or large project work. JARVIS tracks scope, Gemini updates, errors, next steps, and completion.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -613,7 +625,7 @@ class JarvisLive:
             return
         if not hasattr(self, '_speech_queue') or self._speech_queue is None:
             return
-            
+
         asyncio.run_coroutine_threadsafe(
             self._speech_queue.put(text),
             self._loop
@@ -623,6 +635,53 @@ class JarvisLive:
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
+
+    async def _start_development_mode(self, instruction: str, redirected: bool = False) -> str:
+        if not instruction:
+            return "No instruction provided for Development Mode."
+
+        if dev_manager.is_running:
+            msg = "Development mode is already running. I will not start a second project task until the current one finishes or is stopped."
+            self.ui.show_project_monitor()
+            self.ui.log_project_terminal(f"\n[JARVIS PM] {msg}")
+            if not self.ui.muted:
+                self.speak("Zaten çalışan bir geliştirme görevi var. İkinci bir görev başlatmıyorum.")
+            return msg
+
+        self.project_mode = True
+        self.ui.show_project_monitor()
+        self.ui.log_project_terminal(f"\n=== GELİŞTİRME MODU AKTİF ===")
+        if redirected:
+            self.ui.log_project_terminal("Not: Proje kurulum isteği gemini_cli yerine development_mode orkestratörüne yönlendirildi.")
+        self.ui.log_project_terminal(f"Hedef: {instruction}")
+
+        if not self.ui.muted:
+            self.speak("Anladım, görevi Gemini'ye aktarıyorum.")
+
+        await dev_manager.start_session()
+
+        async def run_dev_task():
+            self.ui.add_project_task("dev_orchestrator", "Gemini Geliştirici")
+            self.ui.update_project_task("dev_orchestrator", "in_progress")
+
+            full_response = []
+            async for chunk in dev_manager.send_prompt(instruction, player=self.ui, speak=self.speak):
+                self.ui.log_project_terminal(chunk)
+                full_response.append(chunk)
+
+            if dev_manager.failed_steps:
+                self.ui.update_project_task("dev_orchestrator", "failed")
+                self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ KONTROL GEREKTİRİYOR ===")
+                if not self.ui.muted:
+                    self.speak("Gemini görevleri tamamladı ancak kontrol gerektiren adımlar var. Detaylar Proje Monitöründe.")
+            else:
+                self.ui.update_project_task("dev_orchestrator", "completed")
+                self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ TAMAMLANDI ===")
+                if not self.ui.muted:
+                    self.speak("Proje tamamlandı. Gemini görevlerini bitirdi. Detaylar için Proje Monitörüne bakabilirsiniz.")
+
+        asyncio.create_task(run_dev_task())
+        return "Development mode activated. Orchestrator is working in the background."
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
@@ -852,42 +911,16 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "gemini_cli":
-                r = await loop.run_in_executor(None, lambda: gemini_cli(parameters=args, player=self.ui, speak=self.speak, project_mode=self.project_mode))
-                result = r or "Done."
+                instruction = args.get("instruction", "")
+                if _requires_development_mode(instruction):
+                    result = await self._start_development_mode(instruction, redirected=True)
+                else:
+                    r = await loop.run_in_executor(None, lambda: gemini_cli(parameters=args, player=self.ui, speak=self.speak, project_mode=self.project_mode))
+                    result = r or "Done."
 
             elif name == "development_mode":
                 instruction = args.get("instruction", "")
-                if not instruction:
-                    result = "No instruction provided for Development Mode."
-                else:
-                    self.project_mode = True
-                    self.ui.show_project_monitor()
-                    self.ui.log_project_terminal(f"\n=== GELİŞTİRME MODU AKTİF ===")
-                    self.ui.log_project_terminal(f"Hedef: {instruction}")
-                    
-                    if not self.ui.muted:
-                        self.speak("Anladım, görevi Gemini'ye aktarıyorum.")
-
-                    # Arka planda dev_manager'ı başlat ve prompt gönder
-                    await dev_manager.start_session()
-                    
-                    # Görevi arka planda yürütmek için bir task oluşturuyoruz ki ana loop bloklanmasın
-                    async def run_dev_task():
-                        self.ui.add_project_task("dev_orchestrator", "Gemini Geliştirici")
-                        self.ui.update_project_task("dev_orchestrator", "in_progress")
-                        
-                        full_response = []
-                        async for chunk in dev_manager.send_prompt(instruction, player=self.ui, speak=self.speak):
-                            self.ui.log_project_terminal(chunk)
-                            full_response.append(chunk)
-                        
-                        self.ui.update_project_task("dev_orchestrator", "completed")
-                        self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ TAMAMLANDI ===")
-                        if not self.ui.muted:
-                            self.speak("Proje tamamlandı. Gemini görevlerini bitirdi. Detaylar için Proje Monitörüne bakabilirsiniz.")
-
-                    asyncio.create_task(run_dev_task())
-                    result = "Development mode activated. Orchestrator is working in the background."
+                result = await self._start_development_mode(instruction)
 
             elif name == "assistant_control":
                 action = args.get("action", "").lower()
@@ -909,7 +942,7 @@ class JarvisLive:
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
-                
+
                 # Dev session temizliği
                 asyncio.create_task(dev_manager.stop_session())
 
@@ -945,7 +978,7 @@ class JarvisLive:
         print("[JARVIS] 🗣️ Speech queue processor started")
         while True:
             text = await self._speech_queue.get()
-            
+
             # Wait if currently speaking
             while True:
                 with self._speaking_lock:
@@ -961,7 +994,7 @@ class JarvisLive:
                 )
                 # Allow a short delay for the audio stream to start and _is_speaking to become True
                 await asyncio.sleep(0.5)
-                
+
                 # Wait again until it finishes speaking this response
                 while True:
                     with self._speaking_lock:
@@ -1057,15 +1090,15 @@ class JarvisLive:
                         for fc in response.tool_call.function_calls:
                             if fc.name == "assistant_control" and fc.args.get("action") == "wake":
                                 is_wake_call = True
-                            
+
                             # Execute the tool
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
-                        
+
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
-                        
+
                         # If it was a wake call, we might want to prompt the model to speak
                         if is_wake_call:
                             # The model will respond to the tool result, which is now allowed
@@ -1136,7 +1169,7 @@ class JarvisLive:
 
                     print("[JARVIS] ✅ Connected.")
                     self.ui.set_state("LISTENING")
-                    
+
                     tg.create_task(self._process_speech_queue())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -1163,7 +1196,7 @@ class JarvisLive:
                             turns={"parts": [{"text": "[SYSTEM_NOTIFICATION] Session silently resumed after timeout. Do not greet the user. Wait for their input or continue seamlessly."}]},
                             turn_complete=True
                         )
-                    
+
                     is_reconnect = True
 
             except Exception as e:

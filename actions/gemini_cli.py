@@ -32,8 +32,60 @@ def _strip_fences(text: str) -> str:
     text = re.sub(r"\r?\n?```\s*$", "", text)
     return text.strip()
 
+def _safe_relative_path(base_dir: Path, rel_path: str) -> Path:
+    """Return a path inside base_dir or raise if Gemini tries to write outside."""
+    full_path = (base_dir / rel_path).resolve()
+    base_resolved = base_dir.resolve()
+    if base_resolved not in full_path.parents and full_path != base_resolved:
+        raise ValueError(f"Unsafe path outside project: {rel_path}")
+    return full_path
+
+def _collect_project_context(current_dir: Path) -> str:
+    ignored_dirs = {".git", "__pycache__", "node_modules", "venv", ".venv", "dist", "build"}
+    text_exts = {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json", ".md",
+        ".txt", ".yml", ".yaml", ".toml", ".ini", ".sh",
+    }
+    blocks = []
+    total_chars = 0
+    max_chars = 20000
+
+    for root, dirs, files in os.walk(current_dir):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs]
+        for file_name in sorted(files):
+            full_path = Path(root) / file_name
+            rel_path = os.path.relpath(full_path, current_dir)
+            if full_path.suffix.lower() not in text_exts:
+                blocks.append(f"- {rel_path}")
+                continue
+
+            try:
+                content = full_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                blocks.append(f"- {rel_path} (read failed)")
+                continue
+
+            snippet = content[:2500]
+            block = f"\n--- FILE: {rel_path} ---\n{snippet}"
+            if len(content) > len(snippet):
+                block += "\n... [truncated]"
+
+            if total_chars + len(block) > max_chars:
+                blocks.append("\n... [project context truncated]")
+                return "\n".join(blocks)
+
+            blocks.append(block)
+            total_chars += len(block)
+
+    return "\n".join(blocks)
+
 GEMINI_PROMPT_TEMPLATE = """Sen GEMINI'sin — JARVIS sisteminin geliştirici ajanısın.
-Görevin: sana verilen yazılım projesini uçtan uca tamamlamak.
+JARVIS bu işte PROJE YÖNETİCİSİDİR. Sen kodu üretir, dosyaları değiştirir,
+durumu raporlar ve eksik kalan işleri açıkça bildirirsin. JARVIS senin
+güncellemelerini takip eder, kullanıcı isteklerine göre seni tekrar yönlendirir
+ve proje kapsamı tam bitene kadar süreci yönetir.
+
+Görevin: sana verilen yazılım projesini veya değişiklik isteğini uçtan uca tamamlamak.
 
 ÇALIŞMA KURALLARI:
 
@@ -45,8 +97,8 @@ Her görevi aldığında önce şunu çıkar:
 - Tahmini adım sayısı kaç?
 
 2. ADIM ADIM UYGULA
-Her adımı tek tek uygula. Bir adımı bitirmeden diğerine geçme.
-Her adımın sonunda şu formatta durum bildirimi ver:
+Bu çağrıda uygulanabilecek en doğru ve güvenli adımı uygula. Bir adımı
+bitirmeden diğerine geçme. Her çağrının sonunda şu formatta durum bildirimi ver:
 
 [DURUM RAPORU]
 Tamamlanan: <ne yapıldı, tek cümle>
@@ -97,11 +149,24 @@ Notlar: <varsa dikkat edilecekler>
 [GÖREV SONU]
 
 Current directory: {current_dir}
-Files in project:
-{files_context}
+Project context:
+{project_context}
 
-Provide your plan and the first step's code implementation if applicable, or just the plan if research is needed.
-Return ONLY a JSON list of objects with "path" and "content" for the files you are acting on, AND a "report" field containing the required [DURUM RAPORU] or [PROJE TAMAMLANDI] text.
+Return ONLY valid JSON with this exact shape:
+{{
+  "status": "in_progress" | "completed" | "blocked",
+  "files": [
+    {{"path": "relative/path.ext", "content": "complete file content"}}
+  ],
+  "report": "Required [DURUM RAPORU], [HATA RAPORU], or [PROJE TAMAMLANDI] text",
+  "next_instruction": "If status is in_progress, the next concise instruction JARVIS should send back to Gemini. Empty when completed or blocked."
+}}
+
+Rules for JSON:
+- Use relative file paths only.
+- Include complete file contents for every file you modify.
+- If no file change is needed, use "files": [].
+- Do not include markdown, code fences, or comments outside JSON.
 """
 
 def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) -> str:
@@ -113,35 +178,30 @@ def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) ->
     if not instruction:
         return "Please provide an instruction for the Gemini CLI agent."
 
-    current_dir = get_current_dir()
+    requested_dir = parameters.get("working_dir") or parameters.get("project_dir")
+    current_dir = Path(requested_dir).expanduser().resolve() if requested_dir else get_current_dir()
+    if not current_dir.exists() or not current_dir.is_dir():
+        return f"Hata: Çalışma dizini bulunamadı: {current_dir}"
+    task_id = f"gemini_cli_task_{int(time.time() * 1000) % 100000}"
     
     if player:
         player.write_log(f"[GeminiCLI] Starting task: {instruction[:50]}...")
         if project_mode:
             player.log_project_terminal(f"\n>>> GEMINI DEVELOPER AGENT: {instruction}")
-            player.add_project_task("gemini_cli_task", f"Gemini: {instruction[:40]}")
-            player.update_project_task("gemini_cli_task", "in_progress")
+            player.add_project_task(task_id, f"Gemini: {instruction[:40]}")
+            player.update_project_task(task_id, "in_progress")
 
     if speak and not project_mode:
         speak("Geliştirici ajan görevlendirildi. İşlem başlatılıyor.")
 
-    # 1. Scan the current directory
-    files_list = []
-    for root, dirs, files in os.walk(current_dir):
-        # Ignore common directories
-        dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', 'node_modules', 'venv', '.venv')]
-        for file in files:
-            rel_path = os.path.relpath(os.path.join(root, file), current_dir)
-            files_list.append(rel_path)
-
-    files_context = "\n".join(files_list[:100]) # Limit context
+    project_context = _collect_project_context(current_dir)
 
     # 2. Generate content using the new system prompt
     model = _get_model()
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         instruction=instruction,
         current_dir=current_dir,
-        files_context=files_context
+        project_context=project_context
     )
 
     # Note: In a real implementation, this would likely involve multiple turns 
@@ -149,6 +209,7 @@ def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) ->
     # we'll adapt the internal logic to handle the prompt's structured output.
     
     final_report = ""
+    final_status = "blocked"
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -164,28 +225,38 @@ def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) ->
             try:
                 data = json.loads(raw_text)
                 if isinstance(data, list):
-                    # Old format fallback or mixed
                     plan = data
                     report = "İşlem devam ediyor..."
+                    status = "in_progress"
+                    next_instruction = ""
                 else:
                     plan = data.get("files", [])
                     report = data.get("report", raw_text)
+                    status = data.get("status", "in_progress")
+                    next_instruction = data.get("next_instruction", "")
             except:
                 # Fallback: Parse markdown-like report and extract code blocks if JSON fails
                 report = raw_text
-                plan = [] # Manual extraction would be complex here, so we hope for JSON
+                plan = []
+                status = "blocked"
+                next_instruction = ""
             
             final_report = report
+            final_status = status
+            if next_instruction:
+                final_report += f"\n\n[JARVIS NEXT]\n{next_instruction}"
             
             if player:
                 player.log_project_terminal(f"\n{report}")
+                if status == "in_progress" and next_instruction:
+                    player.log_project_terminal(f"\nNext Gemini instruction: {next_instruction}")
 
             # Apply file changes if any
             for item in plan:
                 path = item.get("path")
                 content = item.get("content")
-                if path and content:
-                    full_path = current_dir / path
+                if path and content is not None:
+                    full_path = _safe_relative_path(current_dir, path)
                     full_path.parent.mkdir(parents=True, exist_ok=True)
                     full_path.write_text(content, encoding="utf-8")
                     if player:
@@ -198,10 +269,12 @@ def gemini_cli(parameters: dict, player=None, speak=None, project_mode=False) ->
                 time.sleep(wait_time)
                 continue
             final_report = f"Hata: {e}"
+            final_status = "blocked"
             break
 
     if player and project_mode:
-        player.update_project_task("gemini_cli_task", "completed")
+        task_status = "failed" if final_status == "blocked" or final_report.lower().startswith("hata:") else "completed"
+        player.update_project_task(task_id, task_status)
     
     if speak and not project_mode:
         speak("Görev tamamlandı.")

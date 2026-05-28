@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import re
 import threading
 import json
@@ -79,15 +80,70 @@ def _clean_transcript(text: str) -> str:
 
 def _requires_development_mode(instruction: str) -> bool:
     low = (instruction or "").lower()
+    explicit_terms = (
+        "development mode", "developer mode", "dev mode",
+        "geliştirme modu", "geliştirici modu", "proje modu",
+        "gemini ile çalış", "gemini cli ile çalış",
+    )
+    if any(term in low for term in explicit_terms):
+        return True
+
     setup_terms = (
         "create", "setup", "set up", "install", "configure", "build",
-        "oluştur", "kur", "yapılandır", "proje",
+        "fix", "develop", "code", "implement",
+        "oluştur", "kur", "yapılandır", "proje", "geliştir",
+        "düzelt", "kod yaz", "uygulama yap", "site yap",
     )
     project_terms = (
         "vite", "react project", "react vite", "npm", "npx",
         "tailwind", "react router", "helmet", "package.json", "node_modules",
+        "uygulama", "web app", "site", "frontend", "backend", "api",
     )
     return any(term in low for term in setup_terms) and any(term in low for term in project_terms)
+
+
+def _strip_development_mode_prefix(instruction: str) -> str:
+    text = (instruction or "").strip()
+    if not text:
+        return text
+    prefixes = (
+        "development mode", "developer mode", "dev mode",
+        "geliştirme modu", "geliştirici modu", "proje modu",
+    )
+    lowered = text.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            stripped = text[len(prefix):].lstrip(" :,-–—")
+            return stripped or text
+    return text
+
+
+def _is_dev_wait_command(text: str) -> bool:
+    low = (text or "").lower().strip()
+    wait_terms = (
+        "bekle", "bekliyorum", "wait", "hold on",
+        "ben söyleyene kadar", "sana söyleyene kadar",
+    )
+    return any(term in low for term in wait_terms)
+
+
+def _is_dev_status_query(text: str) -> bool:
+    low = (text or "").lower().strip()
+    status_terms = (
+        "aktardın mı", "ne durumda", "durum", "bitti mi",
+        "çalışıyor mu", "soruyor mu", "status", "progress",
+    )
+    return any(term in low for term in status_terms)
+
+
+def _is_dev_stop_command(text: str) -> bool:
+    low = (text or "").lower().strip()
+    stop_terms = (
+        "geliştirme modunu durdur", "proje modunu durdur",
+        "geminiyi durdur", "gemini'yi durdur",
+        "stop development", "cancel development",
+    )
+    return any(term in low for term in stop_terms)
 
 TOOL_DECLARATIONS = [
     {
@@ -244,17 +300,20 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage, empty_trash.",
+        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, search file contents, disk usage, empty_trash. Use search_content/find_and_analyze when the user wants to find a file by text inside it.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info | empty_trash"},
+                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | search_content | find_and_analyze | largest | disk_usage | organize_desktop | info | empty_trash"},
                 "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
                 "content":     {"type": "STRING", "description": "Content for create_file/write"},
                 "name":        {"type": "STRING", "description": "File name to search for"},
+                "query":       {"type": "STRING", "description": "Text to search inside readable files"},
+                "content_query": {"type": "STRING", "description": "Text/content clue to find inside files"},
                 "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
+                "max_results": {"type": "INTEGER", "description": "Maximum number of results"},
                 "count":       {"type": "INTEGER", "description": "Number of results for largest"},
             },
             "required": ["action"]
@@ -417,6 +476,7 @@ TOOL_DECLARATIONS = [
         "archives (list/extract), "
         "presentations (summarize/extract_text). "
         "ALWAYS call this tool when a file has been uploaded and the user gives a command about it. "
+        "If the user asks questions about the file, use ask/chat. If they ask for a fast first look, use quick_summary. "
         "If the user's command is ambiguous, pick the most logical action for that file type."
     ),
     "parameters": {
@@ -430,9 +490,10 @@ TOOL_DECLARATIONS = [
                 "type": "STRING",
                 "description": (
                     "What to do with the file. Examples by type:\n"
+                    "all readable files: quick_summary | ask | chat | find_in_file\n"
                     "image: describe | ocr | resize | compress | convert | info\n"
-                    "pdf: summarize | extract_text | to_word | info\n"
-                    "docx/txt: summarize | fix | reformat | translate_hint | word_count | to_bullet\n"
+                    "pdf: summarize | extract_text | to_word | info | ask\n"
+                    "docx/txt: summarize | analyze | fix | reformat | translate_hint | word_count | to_bullet | ask\n"
                     "csv/excel: analyze | stats | filter | sort | convert | info\n"
                     "json: validate | format | analyze | to_csv\n"
                     "code: explain | review | fix | optimize | run | document | test\n"
@@ -604,6 +665,41 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
+        if text.startswith("[FILE_UPLOADED]"):
+            asyncio.run_coroutine_threadsafe(
+                self._handle_file_uploaded(text),
+                self._loop,
+            )
+            return
+        if dev_manager.is_running:
+            if _is_dev_stop_command(text):
+                asyncio.run_coroutine_threadsafe(dev_manager.stop_session(), self._loop)
+                self.ui.log_project_terminal("\n[JARVIS PM] Kullanıcı geliştirme oturumunu durdurdu.")
+                self.speak("Geliştirme oturumunu durduruyorum.")
+                return
+            if _is_dev_wait_command(text):
+                self.ui.log_project_terminal("\n[JARVIS PM] Kullanıcı bekleme talimatı verdi. Yeni görev eklenmedi.")
+                self.speak("Tamam, yeni talimat gelene kadar mevcut işlemi bozmayacağım.")
+                return
+            if _is_dev_status_query(text):
+                status = dev_manager.last_report or "Gemini geliştirme görevi halen çalışıyor."
+                self.ui.log_project_terminal(f"\n[JARVIS PM] Durum soruldu: {status}")
+                self.speak(status)
+                return
+            asyncio.run_coroutine_threadsafe(
+                dev_manager.add_user_instruction(text),
+                self._loop,
+            )
+            self.ui.log_project_terminal(f"\n[JARVIS PM] Ek talimat kuyruğa alındı: {text}")
+            self.speak("Ek talimatı geliştirme kuyruğuna aldım.")
+            return
+        if _requires_development_mode(text):
+            instruction = _strip_development_mode_prefix(text)
+            asyncio.run_coroutine_threadsafe(
+                self._start_development_mode(instruction),
+                self._loop,
+            )
+            return
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"parts": [{"text": text}]},
@@ -612,8 +708,29 @@ class JarvisLive:
             self._loop
         )
 
+    async def _handle_file_uploaded(self, text: str):
+        match = re.search(r"path=([^|]+)", text)
+        path = match.group(1).strip() if match else (self.ui.current_file or "")
+        if not path:
+            return
+        self.ui.write_log("SYS: File loaded. Running quick local analysis...")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: file_processor(
+                parameters={"file_path": path, "action": "quick_summary", "save": False},
+                player=None,
+                speak=None,
+            )
+        )
+        self.ui.write_log(f"FILE_ANALYSIS:\n{result[:1200]}")
+        if not self.ui.muted:
+            self.speak("Dosyayı yükledim ve hızlı analizini hazırladım. Özetlememi, içinde arama yapmamı veya dosya hakkında soru cevap yapmamı isteyebilirsiniz.")
+
     def set_speaking(self, value: bool):
         with self._speaking_lock:
+            if self._is_speaking == value:
+                return
             self._is_speaking = value
         if value:
             self.ui.set_state("SPEAKING")
@@ -664,21 +781,29 @@ class JarvisLive:
             self.ui.add_project_task("dev_orchestrator", "Gemini Geliştirici")
             self.ui.update_project_task("dev_orchestrator", "in_progress")
 
-            full_response = []
-            async for chunk in dev_manager.send_prompt(instruction, player=self.ui, speak=self.speak):
-                self.ui.log_project_terminal(chunk)
-                full_response.append(chunk)
+            try:
+                async for chunk in dev_manager.send_prompt(instruction, player=self.ui, speak=self.speak):
+                    self.ui.log_project_terminal(chunk)
 
-            if dev_manager.failed_steps:
+                if dev_manager.failed_steps:
+                    self.ui.update_project_task("dev_orchestrator", "failed")
+                    self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ KONTROL GEREKTİRİYOR ===")
+                    if not self.ui.muted:
+                        self.speak("Gemini görevleri tamamladı ancak kontrol gerektiren adımlar var. Detaylar Proje Monitöründe.")
+                else:
+                    self.ui.update_project_task("dev_orchestrator", "completed")
+                    self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ TAMAMLANDI ===")
+                    if not self.ui.muted:
+                        self.speak("Proje tamamlandı. Gemini görevlerini bitirdi. Detaylar için Proje Monitörüne bakabilirsiniz.")
+            except Exception as e:
+                traceback.print_exc()
+                dev_manager.failed_steps.append("Orchestrator exception")
                 self.ui.update_project_task("dev_orchestrator", "failed")
-                self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ KONTROL GEREKTİRİYOR ===")
+                self.ui.log_project_terminal(f"\n[HATA] Geliştirme modu beklenmeyen hata ile durdu: {e}")
                 if not self.ui.muted:
-                    self.speak("Gemini görevleri tamamladı ancak kontrol gerektiren adımlar var. Detaylar Proje Monitöründe.")
-            else:
-                self.ui.update_project_task("dev_orchestrator", "completed")
-                self.ui.log_project_terminal("\n=== GELİŞTİRME GÖREVİ TAMAMLANDI ===")
-                if not self.ui.muted:
-                    self.speak("Proje tamamlandı. Gemini görevlerini bitirdi. Detaylar için Proje Monitörüne bakabilirsiniz.")
+                    self.speak("Geliştirme modu beklenmeyen bir hata ile durdu. Detaylar Proje Monitöründe.")
+            finally:
+                await dev_manager.stop_session()
 
         asyncio.create_task(run_dev_task())
         return "Development mode activated. Orchestrator is working in the background."
@@ -711,6 +836,16 @@ class JarvisLive:
                 "EXCEPT if the user says 'Wake up', 'Uyan', 'Jarvis wake up', or similar wake commands. "
                 "When you hear a wake command, you MUST call 'assistant_control' with action='wake' "
                 "to return to active mode, then greet the user normally."
+            )
+
+        if dev_manager.is_running:
+            parts.append(
+                "\n[CRITICAL: DEVELOPMENT MODE ALREADY RUNNING]\n"
+                "A Gemini development session is already active. Do not start a second development_mode "
+                "or gemini_cli task. If the user gives a coding/project follow-up, call gemini_cli once "
+                "with the concise follow-up instruction; the runtime will queue it into the active session. "
+                "If the user says wait/bekle, only acknowledge briefly. If they ask status, summarize the "
+                "latest Project Monitor status."
             )
 
         return types.LiveConnectConfig(
@@ -912,7 +1047,10 @@ class JarvisLive:
 
             elif name == "gemini_cli":
                 instruction = args.get("instruction", "")
-                if _requires_development_mode(instruction):
+                if dev_manager.is_running:
+                    queued = await dev_manager.add_user_instruction(instruction)
+                    result = "Development mode is already running. Instruction was added to the active Gemini queue." if queued else "Development mode is running, but the instruction could not be queued."
+                elif _requires_development_mode(instruction):
                     result = await self._start_development_mode(instruction, redirected=True)
                 else:
                     r = await loop.run_in_executor(None, lambda: gemini_cli(parameters=args, player=self.ui, speak=self.speak, project_mode=self.project_mode))
@@ -920,7 +1058,11 @@ class JarvisLive:
 
             elif name == "development_mode":
                 instruction = args.get("instruction", "")
-                result = await self._start_development_mode(instruction)
+                if dev_manager.is_running:
+                    queued = await dev_manager.add_user_instruction(instruction)
+                    result = "Development mode is already running. Instruction was added to the active Gemini queue." if queued else "Development mode is running, but the instruction could not be queued."
+                else:
+                    result = await self._start_development_mode(instruction)
 
             elif name == "assistant_control":
                 action = args.get("action", "").lower()
@@ -1014,6 +1156,19 @@ class JarvisLive:
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        def enqueue_audio(data: bytes):
+            if not self.out_queue:
+                return
+            try:
+                self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+            except asyncio.QueueFull:
+                try:
+                    self.out_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                with contextlib.suppress(asyncio.QueueFull):
+                    self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
@@ -1021,10 +1176,7 @@ class JarvisLive:
             # otherwise respect the mute button.
             if not jarvis_speaking and (not self.ui.muted or self.sleep_mode):
                 data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+                loop.call_soon_threadsafe(enqueue_audio, data)
 
         try:
             with sd.InputStream(
@@ -1156,10 +1308,7 @@ class JarvisLive:
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
-                async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
-                    asyncio.TaskGroup() as tg,
-                ):
+                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
                     self.session        = session
                     self._loop          = asyncio.get_event_loop()
                     self.audio_in_queue = asyncio.Queue()
@@ -1170,34 +1319,42 @@ class JarvisLive:
                     print("[JARVIS] ✅ Connected.")
                     self.ui.set_state("LISTENING")
 
-                    tg.create_task(self._process_speech_queue())
-                    tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
-                    tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
+                    tasks = [
+                        asyncio.create_task(self._process_speech_queue()),
+                        asyncio.create_task(self._send_realtime()),
+                        asyncio.create_task(self._listen_audio()),
+                        asyncio.create_task(self._receive_audio()),
+                        asyncio.create_task(self._play_audio()),
+                    ]
+                    try:
+                        if not is_reconnect:
+                            self.ui.write_log("SYS: JARVIS online.")
+                            greetings = [
+                                "Yes Sir. Systems are online. I'm pleased to see you again. How are you today?",
+                                "Yes Sir. All systems functioning within normal parameters. It's good to have you back. How can I assist you?",
+                                "Yes Sir. JARVIS is ready. I'm delighted to see you, sir. How are you feeling today?",
+                                "Yes Sir. Always a pleasure to be of service. I'm glad you're here. Is there anything specific on your mind?"
+                            ]
+                            import random
+                            start_text = random.choice(greetings)
+                            await session.send_client_content(
+                                turns={"parts": [{"text": f"[SYSTEM_NOTIFICATION] Session start. Greet the user naturally in English as '{start_text}'. From now on, ALWAYS strictly match the user's language: if they speak English, respond in English; if they speak Turkish, respond in Turkish. No exceptions."}]},
+                                turn_complete=True
+                            )
+                        else:
+                            await session.send_client_content(
+                                turns={"parts": [{"text": "[SYSTEM_NOTIFICATION] Session silently resumed after timeout. Do not greet the user. Wait for their input or continue seamlessly."}]},
+                                turn_complete=True
+                            )
 
-                    if not is_reconnect:
-                        self.ui.write_log("SYS: JARVIS online.")
-                        # Initial greeting
-                        greetings = [
-                            "Yes Sir. Systems are online. I'm pleased to see you again. How are you today?",
-                            "Yes Sir. All systems functioning within normal parameters. It's good to have you back. How can I assist you?",
-                            "Yes Sir. JARVIS is ready. I'm delighted to see you, sir. How are you feeling today?",
-                            "Yes Sir. Always a pleasure to be of service. I'm glad you're here. Is there anything specific on your mind?"
-                        ]
-                        import random
-                        start_text = random.choice(greetings)
-                        await session.send_client_content(
-                            turns={"parts": [{"text": f"[SYSTEM_NOTIFICATION] Session start. Greet the user naturally in English as '{start_text}'. From now on, ALWAYS strictly match the user's language: if they speak English, respond in English; if they speak Turkish, respond in Turkish. No exceptions."}]},
-                            turn_complete=True
-                        )
-                    else:
-                        await session.send_client_content(
-                            turns={"parts": [{"text": "[SYSTEM_NOTIFICATION] Session silently resumed after timeout. Do not greet the user. Wait for their input or continue seamlessly."}]},
-                            turn_complete=True
-                        )
-
-                    is_reconnect = True
+                        is_reconnect = True
+                        await asyncio.gather(*tasks)
+                    finally:
+                        for task in tasks:
+                            task.cancel()
+                        for task in tasks:
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await task
 
             except Exception as e:
                 print(f"[JARVIS] ⚠️ {e}")

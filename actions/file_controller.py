@@ -351,6 +351,67 @@ def find_files(name: str = "", extension: str = "",
         return f"Search error: {e}"
 
 
+def search_file_contents(query: str, path: str = "home", extension: str = "",
+                         max_results: int = 10, max_files: int = 600) -> str:
+    if not query.strip():
+        return "No content query provided."
+    try:
+        from actions.file_processor import _detect_type, extract_text_for_analysis
+
+        search_path = _resolve_path(path)
+        if not _is_safe_path(search_path):
+            return f"Access denied: {search_path}"
+        if not search_path.exists():
+            return f"Search path not found: {path}"
+
+        supported = {"text", "code", "json", "xml", "csv", "excel", "pdf", "docx", "pptx"}
+        results = []
+        checked = 0
+        q = query.lower()
+
+        for item in search_path.rglob("*"):
+            if checked >= max_files or len(results) >= max_results:
+                break
+            if not item.is_file() or item.name.startswith("."):
+                continue
+            if extension and item.suffix.lower() != extension.lower():
+                continue
+            try:
+                if item.stat().st_size > 25 * 1024 * 1024:
+                    continue
+                if _detect_type(item) not in supported:
+                    continue
+                checked += 1
+                text = extract_text_for_analysis(item, max_chars=30000)
+                pos = text.lower().find(q)
+                if pos == -1:
+                    continue
+                start = max(pos - 120, 0)
+                end = min(pos + len(query) + 180, len(text))
+                snippet = " ".join(text[start:end].split())
+                results.append(f"📄 {item.name} — {item.parent}\n   ...{snippet}...")
+            except Exception:
+                continue
+
+        if not results:
+            return f"No content match for '{query}' in {search_path} ({checked} readable files checked)."
+        return f"Found {len(results)} content match(es) for '{query}':\n" + "\n".join(results)
+    except Exception as e:
+        return f"Content search error: {e}"
+
+
+def find_and_analyze_file(name: str = "", extension: str = "", content_query: str = "",
+                          path: str = "home", max_results: int = 5) -> str:
+    try:
+        candidates_text = find_files(name=name, extension=extension, path=path, max_results=max_results)
+        if content_query:
+            content_text = search_file_contents(content_query, path=path, extension=extension, max_results=max_results)
+            return candidates_text + "\n\n" + content_text
+        return candidates_text
+    except Exception as e:
+        return f"Find/analyze error: {e}"
+
+
 def get_largest_files(path: str = "downloads", count: int = 10) -> str:
     count = min(count, 50)  # maksimum 50
     try:
@@ -529,6 +590,23 @@ def file_controller(
                 extension=params.get("extension", ""),
                 path=path,
                 max_results=min(int(params.get("max_results", 20)), 50),
+            )
+
+        elif action == "search_content":
+            return search_file_contents(
+                query=params.get("query") or params.get("content_query", "") or params.get("text", ""),
+                extension=params.get("extension", ""),
+                path=path,
+                max_results=min(int(params.get("max_results", 10)), 30),
+            )
+
+        elif action == "find_and_analyze":
+            return find_and_analyze_file(
+                name=name or params.get("name", ""),
+                extension=params.get("extension", ""),
+                content_query=params.get("content_query", "") or params.get("query", ""),
+                path=path,
+                max_results=min(int(params.get("max_results", 5)), 20),
             )
 
         elif action == "largest":

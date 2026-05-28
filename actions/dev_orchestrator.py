@@ -351,15 +351,25 @@ class DevAgentManager:
         self.completed_steps: list[str] = []
         self.failed_steps: list[str] = []
         self.last_report = ""
+        self._followup_queue: asyncio.Queue[str] | None = None
 
     async def start_session(self):
         self.is_running = True
         self.completed_steps = []
         self.failed_steps = []
         self.last_report = ""
+        self._followup_queue = asyncio.Queue()
 
     async def stop_session(self):
         self.is_running = False
+        self._followup_queue = None
+
+    async def add_user_instruction(self, instruction: str) -> bool:
+        text = (instruction or "").strip()
+        if not text or not self.is_running or self._followup_queue is None:
+            return False
+        await self._followup_queue.put(text)
+        return True
 
     def _pm_update(self, message: str, player=None):
         self.last_report = message
@@ -372,6 +382,69 @@ class DevAgentManager:
         if marker not in report:
             return ""
         return report.split(marker, 1)[1].strip()
+
+    async def _drain_user_instructions(
+        self,
+        work_dir: Path,
+        player=None,
+        speak=None,
+    ) -> AsyncGenerator[str, None]:
+        if self._followup_queue is None:
+            return
+
+        from actions.gemini_cli import gemini_cli
+
+        loop = asyncio.get_event_loop()
+        while self.is_running and self._followup_queue is not None:
+            try:
+                instruction = self._followup_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            step_name = f"Kullanıcı ek talimatı {len(self.completed_steps) + 1}"
+            step_id = f"dev_user_followup_{int(time.time() * 1000) % 100000}"
+            if player:
+                player.add_project_task(step_id, step_name)
+                player.update_project_task(step_id, "in_progress")
+
+            yield f"\n[JARVIS PM] Kullanıcı ek talimatı alındı: {instruction}"
+            if speak and not (player and getattr(player, "muted", False)):
+                speak("Ek talimatı Gemini geliştirme kuyruğuna aldım.")
+
+            managed_instruction = (
+                f"JARVIS PM kapsamı: {self.current_goal}\n"
+                f"Aktif proje dizini: {work_dir}\n"
+                f"Kullanıcıdan gelen ek talimat: {instruction}\n"
+                "Bu talimatı mevcut proje kapsamıyla çelişmeden uygula. "
+                "Önce mevcut dosya yapısını analiz et, gerekli düzeltmeleri yap, "
+                "React/Vite bağımlılıklarını package.json içinde doğrula ve durum raporu ver."
+            )
+
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: gemini_cli(
+                        parameters={
+                            "instruction": managed_instruction,
+                            "working_dir": str(work_dir),
+                        },
+                        player=player,
+                        speak=speak,
+                        project_mode=True,
+                    )
+                )
+                if result.lower().startswith("hata:") or _is_rate_limit_error(result):
+                    raise RuntimeError(result)
+                self.completed_steps.append(step_name)
+                if player:
+                    player.update_project_task(step_id, "completed")
+                yield f"[JARVIS PM] Ek talimat tamamlandı.\nGemini raporu: {result[:500]}"
+            except Exception as e:
+                self.failed_steps.append(step_name)
+                if player:
+                    player.update_project_task(step_id, "failed")
+                yield f"[!] Ek talimat hata verdi: {e}"
+                break
 
     async def send_prompt(self, prompt: str, player=None, speak=None) -> AsyncGenerator[str, None]:
         """
@@ -565,6 +638,8 @@ Return ONLY a JSON list of objects with "step_name", "type" ("shell" or "gemini"
                 if player:
                     player.update_project_task(step_id, "completed")
                 self.completed_steps.append(step_name)
+                async for followup_chunk in self._drain_user_instructions(project_work_dir or base_dir, player=player, speak=speak):
+                    yield followup_chunk
                     
             except Exception as e:
                 last_error = str(e)
@@ -608,6 +683,8 @@ Return ONLY a JSON list of objects with "step_name", "type" ("shell" or "gemini"
                 except Exception as repair_error:
                     yield f"[!] Düzeltme denemesi de başarısız oldu: {repair_error}"
                     break
+                async for followup_chunk in self._drain_user_instructions(project_work_dir or base_dir, player=player, speak=speak):
+                    yield followup_chunk
                 
             # Optional small delay
             await asyncio.sleep(1)
@@ -648,6 +725,8 @@ Return ONLY a JSON list of objects with "step_name", "type" ("shell" or "gemini"
                 yield f"[JARVIS PM] Devam turu tamamlandı.\nGemini raporu: {continuation_result[:500]}"
 
                 pending_next_instruction = self._extract_next_instruction(continuation_result)
+                async for followup_chunk in self._drain_user_instructions(project_work_dir or base_dir, player=player, speak=speak):
+                    yield followup_chunk
             except Exception as e:
                 self.failed_steps.append(step_name)
                 if player:
@@ -655,6 +734,11 @@ Return ONLY a JSON list of objects with "step_name", "type" ("shell" or "gemini"
                 yield f"[!] Devam turu hata verdi: {e}"
                 break
             await asyncio.sleep(1)
+
+        while self.is_running and not self.failed_steps and self._followup_queue is not None and not self._followup_queue.empty():
+            async for followup_chunk in self._drain_user_instructions(project_work_dir or base_dir, player=player, speak=speak):
+                yield followup_chunk
+            await asyncio.sleep(0.2)
 
         if pending_next_instruction and continuation_count >= 3 and not self.failed_steps:
             self.failed_steps.append("Gemini devam limiti")

@@ -27,6 +27,9 @@ from datetime import datetime
 
 import google.generativeai as genai
 
+_TEXT_CACHE: dict[str, tuple[float, int, str]] = {}
+_MAX_AI_CHARS = 60000
+
 
 def _get_api_key() -> str:
     config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
@@ -72,10 +75,128 @@ def _file_size_str(path: Path) -> str:
     if size < 1024**3:     return f"{size/1024**2:.1f} MB"
     return f"{size/1024**3:.1f} GB"
 
+def _file_metadata(path: Path) -> str:
+    stat = path.stat()
+    modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+    return (
+        f"Name: {path.name}\n"
+        f"Type: {_detect_type(path)} ({path.suffix or 'no extension'})\n"
+        f"Size: {_file_size_str(path)}\n"
+        f"Location: {path.parent}\n"
+        f"Modified: {modified}"
+    )
+
 def _output_path(src: Path, suffix: str, new_ext: str = None) -> Path:
     ext  = new_ext or src.suffix
     name = f"{src.stem}_{suffix}{ext}"
     return src.parent / name
+
+def _cached_text(path: Path, reader) -> str:
+    key = str(path.resolve())
+    stat = path.stat()
+    cached = _TEXT_CACHE.get(key)
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    text = reader() or ""
+    _TEXT_CACHE[key] = (stat.st_mtime, stat.st_size, text)
+    return text
+
+def extract_text_for_analysis(path: Path, max_chars: int = _MAX_AI_CHARS) -> str:
+    file_type = _detect_type(path)
+
+    def read_text() -> str:
+        if file_type in ("text", "code", "json", "xml", "unknown"):
+            return path.read_text(encoding="utf-8", errors="ignore")
+        if file_type == "pdf":
+            text = ""
+            try:
+                import pdfplumber
+                with pdfplumber.open(path) as pdf:
+                    for page in pdf.pages:
+                        text += (page.extract_text() or "") + "\n"
+                return text
+            except ImportError:
+                pass
+            try:
+                import PyPDF2
+                with open(path, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page in reader.pages:
+                        text += (page.extract_text() or "") + "\n"
+                return text
+            except Exception:
+                return ""
+        if file_type == "docx":
+            try:
+                from docx import Document
+                doc = Document(path)
+                return "\n".join(p.text for p in doc.paragraphs)
+            except Exception:
+                return ""
+        if file_type == "pptx":
+            try:
+                from pptx import Presentation
+                prs = Presentation(path)
+                chunks = []
+                for i, slide in enumerate(prs.slides, 1):
+                    slide_text = [f"--- Slide {i} ---"]
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text") and shape.text.strip():
+                            slide_text.append(shape.text.strip())
+                    chunks.append("\n".join(slide_text))
+                return "\n\n".join(chunks)
+            except Exception:
+                return ""
+        if file_type in ("csv", "excel"):
+            try:
+                import pandas as pd
+                df = pd.read_csv(path) if file_type == "csv" else pd.read_excel(path)
+                return (
+                    f"Rows: {len(df)}\nColumns: {', '.join(map(str, df.columns))}\n\n"
+                    f"Preview:\n{df.head(80).to_string(index=False)}"
+                )
+            except Exception:
+                return ""
+        return ""
+
+    return _cached_text(path, read_text)[:max_chars]
+
+def _quick_profile(path: Path) -> str:
+    text = extract_text_for_analysis(path, max_chars=12000)
+    meta = _file_metadata(path)
+    if not text.strip():
+        return f"{meta}\n\nQuick analysis: Text could not be extracted locally. Use visual/audio/video analysis if this is media or a scanned document."
+
+    words = len(text.split())
+    lines = text.count("\n") + 1
+    preview = " ".join(text.split())[:700]
+    matches = []
+    for pattern in (r"[\w\.-]+@[\w\.-]+\.\w+", r"\+?\d[\d\s().-]{7,}\d"):
+        matches.extend(re.findall(pattern, text)[:5])
+    found = f"\nPossible key values: {', '.join(matches[:8])}" if matches else ""
+    return (
+        f"{meta}\n"
+        f"Extracted text: {len(text)} chars, about {words} words, {lines} lines.\n"
+        f"Preview: {preview}{found}"
+    )
+
+def _ask_about_file(path: Path, question: str, action: str = "ask") -> str:
+    text = extract_text_for_analysis(path)
+    if not text.strip():
+        return "I could not extract readable text from this file for chat-style analysis."
+    prompt = (
+        "You are helping the user understand a local file. Answer in the user's language. "
+        "Be specific, cite relevant sections by paraphrase, and say clearly if the answer is not in the file.\n\n"
+        f"File metadata:\n{_file_metadata(path)}\n\n"
+        f"User request/action: {action}\n"
+        f"Question: {question or 'Summarize and explain this file conversationally.'}\n\n"
+        f"File text:\n{text[:_MAX_AI_CHARS]}"
+    )
+    try:
+        response = _gemini_client().generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"AI file chat failed: {e}"
 
 def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
     try:
@@ -793,6 +914,27 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     print(log_msg)
     if player:
         player.write_log(log_msg)
+
+    if action in ("quick_summary", "quick_analyze", "preview", "profile", "info_plus"):
+        return _quick_profile(path)
+
+    if action in ("ask", "chat", "question", "qa", "find_in_file", "search"):
+        question = instruction or parameters.get("query", "") or parameters.get("text", "")
+        if action in ("find_in_file", "search") and question:
+            text = extract_text_for_analysis(path)
+            hits = []
+            for i, line in enumerate(text.splitlines(), 1):
+                if question.lower() in line.lower():
+                    hits.append(f"{i}: {line.strip()[:240]}")
+                    if len(hits) >= 12:
+                        break
+            if hits:
+                return f"Found '{question}' in {path.name}:\n" + "\n".join(hits)
+            return f"No direct text match for '{question}' in {path.name}."
+        return _ask_about_file(path, question, action=action)
+
+    if instruction and not action:
+        return _ask_about_file(path, instruction, action="custom")
 
     if file_type == "unknown":
         try:

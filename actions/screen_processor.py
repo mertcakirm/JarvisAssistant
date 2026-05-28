@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import re
@@ -281,14 +282,22 @@ class _VisionSession:
                     backoff = 2.0  
                     print("[Vision] ✅ Connected")
 
-                    async with asyncio.TaskGroup() as tg:
-                        tg.create_task(self._send_loop())
-                        tg.create_task(self._recv_loop())
-                        tg.create_task(self._play_loop())
+                    tasks = [
+                        asyncio.create_task(self._send_loop()),
+                        asyncio.create_task(self._recv_loop()),
+                        asyncio.create_task(self._play_loop()),
+                    ]
+                    try:
+                        await asyncio.gather(*tasks)
+                    finally:
+                        for task in tasks:
+                            task.cancel()
+                        for task in tasks:
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await task
 
-            except* Exception as eg:
-                for exc in eg.exceptions:
-                    print(f"[Vision] ⚠️  Session error: {exc}")
+            except Exception as exc:
+                print(f"[Vision] ⚠️  Session error: {exc}")
             finally:
                 self._session = None
                 self._ready_evt.clear()

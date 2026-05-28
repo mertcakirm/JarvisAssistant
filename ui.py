@@ -690,7 +690,6 @@ class FileDropZone(QWidget):
         self._dash_offset = 0.0
         self._anim_tmr = QTimer(self)
         self._anim_tmr.timeout.connect(self._animate)
-        self._anim_tmr.start(40)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -701,16 +700,27 @@ class FileDropZone(QWidget):
         self._dash_offset = (self._dash_offset + 0.8) % 20
         self._canvas.update()
 
+    def _set_animating(self, enabled: bool):
+        if enabled and not self._anim_tmr.isActive():
+            self._anim_tmr.start(80)
+        elif not enabled and self._anim_tmr.isActive():
+            self._anim_tmr.stop()
+
     def dragEnterEvent(self, e: QDragEnterEvent):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
-            self._drag_over = True; self._canvas.update()
+            self._drag_over = True
+            self._set_animating(True)
+            self._canvas.update()
 
     def dragLeaveEvent(self, e):
-        self._drag_over = False; self._canvas.update()
+        self._drag_over = False
+        self._set_animating(self._hovering)
+        self._canvas.update()
 
     def dropEvent(self, e: QDropEvent):
         self._drag_over = False
+        self._set_animating(self._hovering)
         urls = e.mimeData().urls()
         if urls:
             path = urls[0].toLocalFile()
@@ -723,10 +733,14 @@ class FileDropZone(QWidget):
             self._browse()
 
     def enterEvent(self, e):
-        self._hovering = True; self._canvas.update()
+        self._hovering = True
+        self._set_animating(True)
+        self._canvas.update()
 
     def leaveEvent(self, e):
-        self._hovering = False; self._canvas.update()
+        self._hovering = False
+        self._set_animating(self._drag_over)
+        self._canvas.update()
 
     def current_file(self) -> str | None:
         return self._current_file
@@ -1613,6 +1627,7 @@ class JarvisUI:
         self._win = MainWindow(face_path)
         self._win.show()
         self.root = _RootShim(self._app)
+        self._last_state = None
 
     def show_project_monitor(self):
         self._win._pm_show_sig.emit()
@@ -1651,6 +1666,9 @@ class JarvisUI:
         self._win.on_text_command = cb
 
     def set_state(self, state: str):
+        if state == self._last_state:
+            return
+        self._last_state = state
         self._win._state_sig.emit(state)
 
     def write_log(self, text: str):
